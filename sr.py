@@ -9,6 +9,7 @@ from gensim.test.utils import common_texts
 from gensim.models import Word2Vec
 import io
 import logging
+from models import InferSent
 from nltk.corpus import stopwords
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.tokenize import TweetTokenizer
@@ -17,10 +18,12 @@ import os
 import pandas as pd
 import pickle
 import random
+from random import randint
 from rank_bm25 import BM25Okapi, BM25L, BM25Plus
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import string
+import torch
 from tqdm import tqdm_notebook as tqdm
 from unidecode import unidecode
 
@@ -31,6 +34,7 @@ data_path = os.path.dirname(os.path.abspath(''))
 wiki_path = os.path.join(data_path, "FEVER_data/wiki_pages.csv")
 glove_path = os.path.join(data_path, 'glove.840B.300d.txt')
 fasttext_path = os.path.join(data_path, 'cc.en.300.vec')
+infersent_path = os.path.join(data_path, "encoder/infersent%s.pkl")
 
 tknzr = TweetTokenizer()
 stop = stopwords.words('english')
@@ -73,6 +77,23 @@ def load_glove(fname='glove.840B.300d.txt'):
             except:
                 continue
     logging.info('done')
+    
+
+def load_infersent(model_path="encoder/infersent%s.pkl", glove_path='glove.840B.300d.txt', fasttext_path='cc.en.300.vec'):
+    model_version = 1
+    MODEL_PATH = os.path.expanduser(model_path % model_version)
+    params_model = {'bsize': 64, 'word_emb_dim': 300, 'enc_lstm_dim': 2048,
+                    'pool_type': 'max', 'dpout_model': 0.0, 'version': model_version}
+    model = InferSent(params_model)
+    model.load_state_dict(torch.load(MODEL_PATH))
+    if torch.cuda.is_available():
+        use_cuda = True
+    model = model.cuda() if use_cuda else model
+
+    W2V_PATH = os.path.expanduser(glove_path) if model_version == 1 else fasttext_path
+    model.set_w2v_path(W2V_PATH)
+    model.build_vocab_k_words(K=100000)
+    return model
 
 
 def w2v(word):
@@ -106,16 +127,17 @@ def get_jaccard_sim(str1, str2):
 
 
 def find_sentences_in_document(mode, data, claim, title,
-                               claim_emb=None, word_vectors=None, claim_entities=None, argsort=False):
+                               claim_emb=None, model=None, word_vectors=None, claim_entities=None, argsort=False):
     '''
     mode 1: tf-idf
     mode 2: jaccard
     mode 3: glove
     mode 4: fasttext
-    mode 5: 0.5 * tf-idf + 0.5 * glove
+    mode 5: tf-idf + glove
     mode 6: wmd
     mode 7: entity filtering
     mode 8: bm25
+    mode 9: tf-idf + infersent
     '''
     
     if data != []:
@@ -198,17 +220,24 @@ def find_sentences_in_document(mode, data, claim, title,
                           if word not in stop and len(word) > 2 and word not in string.punctuation]
         sims = bm25.get_scores(tokenized_query)
         
+    elif mode == 9:
+        sent_embs = model.encode(text, tokenize=True)
+        tfidf = vectorizer.fit_transform([claim] + text)
+        sims = 0.55 * cosine_similarity(claim_emb, sent_embs).flatten() + 0.45 * cosine_similarity(tfidf[0], tfidf).flatten()[1:]
+    
     if argsort:
         return sims.argsort()
     else:
         return sims
 
 
-def find_sentences(urls, coref, claim, mode, top, word_vectors=None):
+def find_sentences(urls, coref, claim, mode, top, model=None, word_vectors=None):
     result = {}
     if mode in [3, 4, 5]:
         claim_emb = np.mean([w2v_embs[word] for word in tknzr.tokenize(claim) 
                              if word in w2v_embs and word not in stop and word not in string.punctuation], axis=0)
+    elif mode == 9:
+        claim_emb = model.encode([claim], tokenize=True)
     else:
         claim_emb = None
     
@@ -220,7 +249,7 @@ def find_sentences(urls, coref, claim, mode, top, word_vectors=None):
         title = unidecode(title.replace('(', '-LRB-').replace(')', '-RRB-').replace(':' , '-COLON-'))
         try:
             data = coref.get(title, [])
-            similarities = find_sentences_in_document(mode, data, claim, title, claim_emb, word_vectors)
+            similarities = find_sentences_in_document(mode, data, claim, title, claim_emb, model, word_vectors)
             sims = np.concatenate([sims, similarities])
             lens.append(len(similarities) + lens[-1])
             titles.append(title)
@@ -259,7 +288,7 @@ def sr_quality_estimation(mode=1, top=5, use_coreference=False, ann_type='Stanfo
         documents = pickle.load(f)
     
     if total is None:
-        total = len(claims)     # actually coreference resolution exists only for the first 7000 dev. claims
+        total = len(claims)
     
     coref = {}
     if use_coreference:
@@ -276,6 +305,9 @@ def sr_quality_estimation(mode=1, top=5, use_coreference=False, ann_type='Stanfo
         model = Word2Vec(common_texts, size=100, window=5, min_count=1, workers=4)
         word_vectors = model.wv
         
+    if mode == 3:
+        model = load_infersent(infersent_path)
+        
     if w == {}:
         load_wiki(wiki_path)
     
@@ -287,7 +319,7 @@ def sr_quality_estimation(mode=1, top=5, use_coreference=False, ann_type='Stanfo
             urls = documents[i]
             if use_coreference and i < len(corefs):
                  coref = corefs[i]
-            result = find_sentences(urls, coref, claim, mode, top, word_vectors)
+            result = find_sentences(urls, coref, claim, mode, top, model, word_vectors)
             for p in evidences[i]:
                 if len(p) == 1:
                     found = False
@@ -318,6 +350,9 @@ def save_sr_results(claims, documents, mode, task_type, total=None, top=20, use_
     if mode == 6:
         model = Word2Vec(common_texts, size=100, window=5, min_count=1, workers=4)
         word_vectors = model.wv
+    
+    if mode == 3:
+        model = load_infersent(infersent_path)
         
     if w == {}:
         load_wiki(wiki_path)
@@ -329,7 +364,7 @@ def save_sr_results(claims, documents, mode, task_type, total=None, top=20, use_
         urls = documents[i]
         if use_coreference and i < len(corefs):
             coref = corefs[i]
-        result = find_sentences(urls, coref, claim, mode, top, word_vectors)
+        result = find_sentences(urls, coref, claim, mode, top, model, word_vectors)
         saver.append(result)
     
     with open('results/results_{}.pickle'.format(task_type), 'wb') as f:
@@ -417,7 +452,7 @@ def sentence_retrieval(task_type, claims=None, mode=1, total=None, top=20,
     create_bert_file(task_type, claims, mode, total, top, use_coreference_bert, use_coreference_search, ann_type)
                 
                 
-def create_train_bert_file(task_type, top=1):
+def create_train_bert_file(task_type, top=3):
     assert task_type in ["train", 'dev']
     
     if w == {}:
